@@ -13,7 +13,7 @@ from flowsint_types.ip import Ip
 
 
 @flowsint_enricher
-class IpToAsnEnricher(Enricher):
+class IpToAsnCymruEnricher(Enricher):
     """[TEAM CYMRU] Resolve an IP address to its BGP origin ASN using DNS."""
 
     InputType = Ip
@@ -45,8 +45,7 @@ class IpToAsnEnricher(Enricher):
 
     @classmethod
     def name(cls) -> str:
-        # Keep the existing enricher identifier so this is a drop-in replacement.
-        return "ip_to_asn"
+        return "to_asn_cymru"
 
     @classmethod
     def category(cls) -> str:
@@ -334,5 +333,5 @@ class IpToAsnEnricher(Enricher):
         return unique
 
 
-InputType = IpToAsnEnricher.InputType
-OutputType = IpToAsnEnricher.OutputType
+InputType = IpToAsnCymruEnricher.InputType
+OutputType = IpToAsnCymruEnricher.OutputType
