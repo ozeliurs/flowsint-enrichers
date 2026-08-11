@@ -1,6 +1,8 @@
 from collections import defaultdict
 from datetime import datetime, timezone
+import asyncio
 import ipaddress
+import socket
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -8,9 +10,6 @@ from pydantic import BaseModel, Field
 
 from flowsint_core.core.enricher_base import Enricher
 from flowsint_core.core.logger import Logger
-from flowsint_enrichers.domain.to_geonet_shodan import (
-    DomainToGeoNetShodanEnricher,
-)
 from flowsint_enrichers.registry import flowsint_enricher
 from flowsint_types.asn import ASN
 from flowsint_types.cidr import CIDR
@@ -25,10 +24,6 @@ CLOUDFLARE_IPV4_URL = "https://www.cloudflare.com/ips-v4/"
 CLOUDFLARE_IPV6_URL = "https://www.cloudflare.com/ips-v6/"
 
 
-# Current Cloudflare ranges.
-#
-# These are only used if the live Cloudflare endpoints cannot
-# be retrieved when the enricher runs.
 CLOUDFLARE_IPV4_FALLBACK = (
     "173.245.48.0/20",
     "103.21.244.0/22",
@@ -69,19 +64,20 @@ class ShodanCTCertificate(BaseModel):
 
 class ShodanCTLookup(BaseModel):
     domain: str
-    certificates: List[ShodanCTCertificate] = Field(
+
+    certificates: List[
+        ShodanCTCertificate
+    ] = Field(
         default_factory=list
     )
 
     #
-    # Only domains with at least one A / AAAA result
-    # appear here.
+    # domain -> resolved A / AAAA addresses
     #
-    # The root domain may be absent if it currently
-    # has no address record. It is still kept in the
-    # graph because it was the original input.
-    #
-    resolved_ips: Dict[str, List[str]] = Field(
+    resolved_ips: Dict[
+        str,
+        List[str],
+    ] = Field(
         default_factory=dict
     )
 
@@ -89,19 +85,19 @@ class ShodanCTLookup(BaseModel):
 @flowsint_enricher
 class DomainToShodanCTEnricher(Enricher):
     """
-    Discover domains through Shodan Certificate Transparency,
-    validate discovered subdomains using Shodan GeoNet, and
-    remove non-resolving CT artifacts from the graph.
+    Discover domains using Shodan Certificate Transparency,
+    validate them through local DNS resolution, and populate
+    the graph with resolving infrastructure only.
 
-    Graph model:
+    Graph:
 
         example.com
             |
             +-- HAS_SUBDOMAIN --> app.example.com
             |                       |
-            |                       +-- RESOLVES_TO --> 203.0.113.10
+            |                       +-- RESOLVES_TO --> Ip
             |                       |
-            |                       +-- HOSTED_IN ----> CLOUDFLARENET
+            |                       +-- HOSTED_IN --> CLOUDFLARENET
             |
             +-- HAS_CT_CERTIFICATE --> SSLCertificate
 
@@ -109,7 +105,9 @@ class DomainToShodanCTEnricher(Enricher):
             |
             +-- HAS_DOMAIN --> app.example.com
 
-    Cloudflare addresses are collapsed into one ASN node.
+    Non-resolving CT-discovered domains are discarded.
+
+    Cloudflare IPs are collapsed into a single ASN node.
     """
 
     InputType = Domain
@@ -131,56 +129,51 @@ class DomainToShodanCTEnricher(Enricher):
     def documentation(cls) -> str:
         return """
         Query Shodan Certificate Transparency and validate
-        discovered subdomains using Shodan GeoNet.
+        discovered domains through local DNS resolution.
 
         Workflow:
 
-        1. Query:
+        1. Query Shodan CT:
 
                GET https://ctl.shodan.io/api/v1/domain/{domain}
 
         2. Extract Subject CN and SAN DNS names.
 
-        3. Normalize wildcard names:
+        3. Normalize wildcards:
 
                *.app.example.com
                    ->
                app.example.com
 
-        4. Resolve every in-scope discovered domain through
-           the GeoNet enricher.
+        4. Resolve every discovered in-scope hostname using
+           the system DNS resolver through Python
+           socket.getaddrinfo().
 
-        5. Drop CT-discovered subdomains with no A or AAAA
-           result.
+        5. Keep only hostnames with at least one IPv4 or IPv6
+           address.
 
-        6. Link domain hierarchy using:
+        6. Build the hierarchy using:
 
                HAS_SUBDOMAIN
 
-        7. Link certificates to covered domains using:
+        7. Link certificates using:
 
                HAS_DOMAIN
 
-           Subject/SAN duplicates therefore produce only one
-           graph relationship.
-
-        8. Cloudflare IPs are detected against Cloudflare's
-           published IPv4 and IPv6 proxy ranges.
-
-           Instead of creating every Cloudflare IP node:
-
-               Domain
-                   |
-                   +-- HOSTED_IN --> CLOUDFLARENET
-
-        9. Non-Cloudflare IPs remain:
+        8. Normal IPs:
 
                Domain
                    |
                    +-- RESOLVES_TO --> Ip
 
-        Root -> HAS_CT_CERTIFICATE is only created when the
-        certificate explicitly covers:
+        9. Cloudflare addresses:
+
+               Domain
+                   |
+                   +-- HOSTED_IN --> CLOUDFLARENET
+
+        Root -> HAS_CT_CERTIFICATE is only created for
+        certificates explicitly covering:
 
                example.com
 
@@ -195,10 +188,9 @@ class DomainToShodanCTEnricher(Enricher):
     ) -> List[OutputType]:
         results: List[OutputType] = []
 
-        #
-        # Populated here and consumed by postprocess().
-        #
-        self._cloudflare_cidr_strings: List[str] = []
+        self._cloudflare_cidr_strings: List[
+            str
+        ] = []
 
         self._cloudflare_networks: List[
             ipaddress.IPv4Network
@@ -212,26 +204,8 @@ class DomainToShodanCTEnricher(Enricher):
                 "accept": "application/json",
             },
         ) as client:
-            #
-            # Pull the current Cloudflare ranges.
-            #
             await self._load_cloudflare_networks(
                 client
-            )
-
-            #
-            # Reuse the existing GeoNet enricher.
-            #
-            # We intentionally call scan() instead of
-            # execute(), because this CT enricher controls
-            # the final graph generation.
-            #
-            geonet = (
-                DomainToGeoNetShodanEnricher(
-                    sketch_id=self.sketch_id,
-                    scan_id=self.scan_id,
-                    graph_service=self._graph_service,
-                )
             )
 
             for domain_obj in data:
@@ -251,10 +225,6 @@ class DomainToShodanCTEnricher(Enricher):
                 if certificates is None:
                     continue
 
-                #
-                # Extract every in-scope domain discovered
-                # through Subject CN / SAN.
-                #
                 candidate_domains = (
                     self._collect_in_scope_domains(
                         root_domain,
@@ -263,23 +233,20 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
                 #
-                # Resolve the root too.
-                #
-                # Failure to resolve it doesn't delete it
-                # because it's the user's original node.
+                # Resolve root as well so we can display
+                # its infrastructure if available.
                 #
                 candidate_domains.add(
                     root_domain
                 )
 
                 resolved_ips = (
-                    await self._resolve_domains_with_geonet(
-                        geonet,
-                        candidate_domains,
+                    await self._resolve_domains(
+                        candidate_domains
                     )
                 )
 
-                unresolved_subdomains = sorted(
+                unresolved = sorted(
                     domain
                     for domain
                     in candidate_domains
@@ -290,7 +257,7 @@ class DomainToShodanCTEnricher(Enricher):
                     )
                 )
 
-                if unresolved_subdomains:
+                if unresolved:
                     Logger.info(
                         self.sketch_id,
                         {
@@ -298,9 +265,8 @@ class DomainToShodanCTEnricher(Enricher):
                                 f"[Shodan CT] "
                                 f"{root_domain}: "
                                 f"pruning "
-                                f"{len(unresolved_subdomains)} "
-                                f"CT-discovered subdomains "
-                                f"with no A/AAAA GeoNet result"
+                                f"{len(unresolved)} "
+                                f"non-resolving CT domains"
                             )
                         },
                     )
@@ -311,7 +277,8 @@ class DomainToShodanCTEnricher(Enricher):
                         certificates=certificates,
                         resolved_ips={
                             domain: sorted(
-                                addresses
+                                addresses,
+                                key=self._ip_sort_key,
                             )
                             for (
                                 domain,
@@ -324,9 +291,10 @@ class DomainToShodanCTEnricher(Enricher):
                     )
                 )
 
-                retained_subdomains = sum(
+                retained = sum(
                     1
-                    for domain in resolved_ips
+                    for domain
+                    in resolved_ips
                     if domain != root_domain
                 )
 
@@ -337,9 +305,9 @@ class DomainToShodanCTEnricher(Enricher):
                             f"[Shodan CT] "
                             f"{root_domain}: "
                             f"{len(certificates)} "
-                            f"unique certificates, "
-                            f"{retained_subdomains} "
-                            f"resolving subdomains retained"
+                            f"certificates, "
+                            f"{retained} resolving "
+                            f"subdomains retained"
                         )
                     },
                 )
@@ -377,9 +345,6 @@ class DomainToShodanCTEnricher(Enricher):
             ]
         ] = set()
 
-        #
-        # SSLCertificate is keyed by subject in Flowsint.
-        #
         certificates_by_subject: Dict[
             str,
             Dict[
@@ -393,12 +358,6 @@ class DomainToShodanCTEnricher(Enricher):
             set[str],
         ] = defaultdict(set)
 
-        #
-        # subject -> domain -> {subject, san}
-        #
-        # We preserve these roles as metadata, but graph
-        # relationships are collapsed into HAS_DOMAIN.
-        #
         domain_roles_by_subject: Dict[
             str,
             Dict[
@@ -409,25 +368,16 @@ class DomainToShodanCTEnricher(Enricher):
             lambda: defaultdict(set)
         )
 
-        #
-        # Only root / *.root certificates get a direct
-        # root -> certificate relationship.
-        #
         root_certificate_links: set[
             Tuple[str, str]
         ] = set()
 
-        #
-        # Used so certificates which only concern dead,
-        # non-resolving subdomains don't become orphan
-        # graph nodes.
-        #
         active_certificate_subjects: set[
             str
         ] = set()
 
         #
-        # Original input nodes are always kept.
+        # Preserve original input nodes.
         #
         for domain_obj in (
             input_data
@@ -463,8 +413,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
             #
-            # Only GeoNet-validated in-scope domains
-            # survive.
+            # Domains which passed DNS resolution.
             #
             retained_in_scope = {
                 domain
@@ -477,14 +426,15 @@ class DomainToShodanCTEnricher(Enricher):
             }
 
             #
-            # Root is always retained.
+            # Root itself is always retained because
+            # it was the original user input.
             #
             retained_in_scope.add(
                 root.domain
             )
 
             #
-            # Standard domain hierarchy.
+            # Domain hierarchy.
             #
             for subdomain in sorted(
                 retained_in_scope
@@ -522,7 +472,7 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
             #
-            # Resolution graph.
+            # DNS resolution graph.
             #
             for (
                 domain_name,
@@ -546,9 +496,8 @@ class DomainToShodanCTEnricher(Enricher):
 
                 for address in addresses:
                     #
-                    # Cloudflare:
-                    #
-                    # Don't create the individual IP.
+                    # Cloudflare address:
+                    # collapse into ASN.
                     #
                     if self._is_cloudflare_ip(
                         address
@@ -577,7 +526,7 @@ class DomainToShodanCTEnricher(Enricher):
                         continue
 
                     #
-                    # Normal/non-Cloudflare IP.
+                    # Normal IP.
                     #
                     ip_node = self._safe_ip(
                         address
@@ -606,7 +555,7 @@ class DomainToShodanCTEnricher(Enricher):
                     )
 
             #
-            # Certificates.
+            # Certificate processing.
             #
             for cert in (
                 lookup.certificates
@@ -631,7 +580,7 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
                 #
-                # Root or *.root only.
+                # Root certificate only.
                 #
                 if (
                     self._certificate_covers_root(
@@ -707,7 +656,7 @@ class DomainToShodanCTEnricher(Enricher):
         )
 
         #
-        # Build aggregated certificate nodes.
+        # Certificate nodes.
         #
         for subject in sorted(
             active_certificate_subjects
@@ -811,9 +760,7 @@ class DomainToShodanCTEnricher(Enricher):
                 is_valid=is_valid,
                 is_expired=is_expired,
                 is_wildcard=(
-                    subject.startswith(
-                        "*."
-                    )
+                    subject.startswith("*.")
                     or any(
                         san.startswith("*.")
                         for san
@@ -893,9 +840,8 @@ class DomainToShodanCTEnricher(Enricher):
             ] = cert_node
 
             #
-            # One HAS_DOMAIN relationship regardless
-            # of whether the hostname appeared in
-            # Subject, SAN, or both.
+            # Subject/SAN are collapsed into one
+            # HAS_DOMAIN relationship.
             #
             for domain_name in (
                 domain_roles_by_subject[
@@ -917,7 +863,7 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
         #
-        # Root certificates only.
+        # Root certificate relationships.
         #
         for (
             root_domain,
@@ -944,7 +890,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Domain nodes.
+        # Create Domains.
         #
         for domain_name in sorted(
             domain_nodes
@@ -967,28 +913,18 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Non-Cloudflare IP nodes.
+        # Create normal IPs.
         #
         for address in sorted(
-            ip_nodes
+            ip_nodes,
+            key=self._ip_sort_key,
         ):
-            node = ip_nodes[
-                address
-            ]
-
-            setattr(
-                node,
-                "geonet_source",
-                "Shodan GeoNet",
-            )
-
             self.create_node(
-                node
+                ip_nodes[address]
             )
 
         #
-        # One Cloudflare node regardless of how
-        # many addresses matched.
+        # Create one Cloudflare ASN.
         #
         if (
             cloudflare_used
@@ -1000,7 +936,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Certificate nodes.
+        # Create certificates.
         #
         for subject in sorted(
             certificate_nodes
@@ -1012,7 +948,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Relationships.
+        # Create relationships.
         #
         for (
             source_key,
@@ -1066,6 +1002,121 @@ class DomainToShodanCTEnricher(Enricher):
 
         return results
 
+    #
+    # ---------------------------------------------------------
+    # DNS
+    # ---------------------------------------------------------
+    #
+
+    async def _resolve_domains(
+        self,
+        domains: set[str],
+    ) -> Dict[
+        str,
+        set[str],
+    ]:
+        """
+        Resolve all domains locally using the system resolver.
+
+        socket.getaddrinfo(AF_UNSPEC) retrieves both A and
+        AAAA records where available.
+
+        Resolution happens concurrently without blocking
+        the asyncio event loop.
+        """
+
+        tasks = {
+            domain: asyncio.create_task(
+                asyncio.to_thread(
+                    self._resolve_domain_sync,
+                    domain,
+                )
+            )
+            for domain in domains
+        }
+
+        resolved: Dict[
+            str,
+            set[str],
+        ] = {}
+
+        for (
+            domain,
+            task,
+        ) in tasks.items():
+            try:
+                addresses = await task
+
+            except Exception:
+                addresses = set()
+
+            if addresses:
+                resolved[
+                    domain
+                ] = addresses
+
+        return resolved
+
+    @staticmethod
+    def _resolve_domain_sync(
+        domain: str,
+    ) -> set[str]:
+        """
+        Synchronous DNS resolution executed inside a worker
+        thread.
+
+        Uses AF_UNSPEC to retrieve both IPv4 and IPv6.
+        """
+
+        addresses: set[
+            str
+        ] = set()
+
+        try:
+            results = socket.getaddrinfo(
+                domain,
+                None,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+
+        except (
+            socket.gaierror,
+            socket.herror,
+            TimeoutError,
+        ):
+            return addresses
+
+        for result in results:
+            sockaddr = result[4]
+
+            if not sockaddr:
+                continue
+
+            address = sockaddr[0]
+
+            try:
+                normalized = str(
+                    ipaddress.ip_address(
+                        address
+                    )
+                )
+
+            except ValueError:
+                continue
+
+            addresses.add(
+                normalized
+            )
+
+        return addresses
+
+    #
+    # ---------------------------------------------------------
+    # SHODAN CT
+    # ---------------------------------------------------------
+    #
+
     async def _fetch_ct_certificates(
         self,
         client: httpx.AsyncClient,
@@ -1088,8 +1139,7 @@ class DomainToShodanCTEnricher(Enricher):
                 {
                     "message": (
                         f"[Shodan CT] "
-                        f"{domain}: "
-                        f"HTTP "
+                        f"{domain}: HTTP "
                         f"{exc.response.status_code}"
                     )
                 },
@@ -1116,9 +1166,8 @@ class DomainToShodanCTEnricher(Enricher):
                 self.sketch_id,
                 {
                     "message": (
-                        f"[Shodan CT] "
-                        f"Invalid JSON for "
-                        f"{domain}"
+                        f"[Shodan CT] Invalid "
+                        f"JSON for {domain}"
                     )
                 },
             )
@@ -1133,9 +1182,8 @@ class DomainToShodanCTEnricher(Enricher):
                 self.sketch_id,
                 {
                     "message": (
-                        f"[Shodan CT] "
-                        f"Unexpected response "
-                        f"for {domain}"
+                        f"[Shodan CT] Unexpected "
+                        f"response for {domain}"
                     )
                 },
             )
@@ -1233,125 +1281,11 @@ class DomainToShodanCTEnricher(Enricher):
             ),
         )
 
-    async def _resolve_domains_with_geonet(
-        self,
-        geonet: (
-            DomainToGeoNetShodanEnricher
-        ),
-        domains: set[str],
-    ) -> Dict[
-        str,
-        set[str],
-    ]:
-        inputs: List[
-            Domain
-        ] = []
-
-        for domain in sorted(
-            domains
-        ):
-            node = self._safe_domain(
-                domain
-            )
-
-            if node is not None:
-                inputs.append(
-                    node
-                )
-
-        if not inputs:
-            return {}
-
-        try:
-            #
-            # This invokes your existing GeoNet
-            # enricher logic.
-            #
-            geonet_results = (
-                await geonet.scan(
-                    inputs
-                )
-            )
-
-        except Exception as exc:
-            Logger.error(
-                self.sketch_id,
-                {
-                    "message": (
-                        "[Shodan CT] "
-                        "GeoNet chained "
-                        "resolution failed: "
-                        f"{type(exc).__name__}: "
-                        f"{exc}"
-                    )
-                },
-            )
-
-            return {}
-
-        resolved: Dict[
-            str,
-            set[str],
-        ] = defaultdict(set)
-
-        for record in (
-            geonet_results
-        ):
-            record_type = str(
-                getattr(
-                    record,
-                    "record_type",
-                    "",
-                )
-            ).upper()
-
-            #
-            # Only A / AAAA determine whether
-            # the hostname actually resolves.
-            #
-            if record_type not in {
-                "A",
-                "AAAA",
-            }:
-                continue
-
-            domain = str(
-                getattr(
-                    record,
-                    "domain",
-                    "",
-                )
-            ).lower().rstrip(".")
-
-            value = str(
-                getattr(
-                    record,
-                    "value",
-                    "",
-                )
-            ).strip()
-
-            if (
-                not domain
-                or not value
-            ):
-                continue
-
-            try:
-                ipaddress.ip_address(
-                    value
-                )
-
-            except ValueError:
-                continue
-
-            resolved[
-                domain
-            ].add(
-                value
-            )
-
-        return resolved
+    #
+    # ---------------------------------------------------------
+    # CLOUDFLARE
+    # ---------------------------------------------------------
+    #
 
     async def _load_cloudflare_networks(
         self,
@@ -1378,10 +1312,9 @@ class DomainToShodanCTEnricher(Enricher):
                 self.sketch_id,
                 {
                     "message": (
-                        "[Shodan CT] "
-                        "Could not retrieve "
-                        "Cloudflare IPv4 ranges; "
-                        "using embedded fallback"
+                        "[Shodan CT] Could not "
+                        "retrieve Cloudflare IPv4 "
+                        "ranges; using fallback"
                     )
                 },
             )
@@ -1395,10 +1328,9 @@ class DomainToShodanCTEnricher(Enricher):
                 self.sketch_id,
                 {
                     "message": (
-                        "[Shodan CT] "
-                        "Could not retrieve "
-                        "Cloudflare IPv6 ranges; "
-                        "using embedded fallback"
+                        "[Shodan CT] Could not "
+                        "retrieve Cloudflare IPv6 "
+                        "ranges; using fallback"
                     )
                 },
             )
@@ -1406,8 +1338,7 @@ class DomainToShodanCTEnricher(Enricher):
         self._cloudflare_cidr_strings = (
             list(
                 dict.fromkeys(
-                    v4
-                    + v6
+                    v4 + v6
                 )
             )
         )
@@ -1425,10 +1356,9 @@ class DomainToShodanCTEnricher(Enricher):
             self.sketch_id,
             {
                 "message": (
-                    f"[Shodan CT] "
-                    f"Loaded {len(v4)} "
-                    f"Cloudflare IPv4 and "
-                    f"{len(v6)} IPv6 ranges"
+                    f"[Shodan CT] Loaded "
+                    f"{len(v4)} Cloudflare IPv4 "
+                    f"and {len(v6)} IPv6 ranges"
                 )
             },
         )
@@ -1492,10 +1422,6 @@ class DomainToShodanCTEnricher(Enricher):
     def _build_cloudflare_asn(
         self,
     ) -> ASN:
-        #
-        # Native Flowsint ASN requires
-        # an AS<number> identifier.
-        #
         asn = ASN(
             asn_str="AS13335",
             number=13335,
@@ -1515,19 +1441,12 @@ class DomainToShodanCTEnricher(Enricher):
         )
 
         #
-        # Keep the graph visually compact.
+        # Make the visual graph node compact.
         #
         asn.nodeLabel = (
             "CLOUDFLARENET"
         )
 
-        #
-        # Native cidrs remains List[CIDR],
-        # as required by Flowsint.
-        #
-        # Also provide the exact convenient
-        # comma-separated representation.
-        #
         setattr(
             asn,
             "cidr_blocks_csv",
@@ -1539,10 +1458,7 @@ class DomainToShodanCTEnricher(Enricher):
         setattr(
             asn,
             "source",
-            (
-                "Cloudflare published "
-                "IP ranges"
-            ),
+            "Cloudflare published IP ranges",
         )
 
         return asn
@@ -1576,6 +1492,12 @@ class DomainToShodanCTEnricher(Enricher):
                 return True
 
         return False
+
+    #
+    # ---------------------------------------------------------
+    # CT / DOMAIN HELPERS
+    # ---------------------------------------------------------
+    #
 
     @staticmethod
     def _collect_in_scope_domains(
@@ -1662,12 +1584,6 @@ class DomainToShodanCTEnricher(Enricher):
         if not normalized:
             return
 
-        #
-        # In-scope subdomain?
-        #
-        # It must have survived GeoNet
-        # resolution.
-        #
         if (
             DomainToShodanCTEnricher
             ._belongs_to(
@@ -1675,6 +1591,10 @@ class DomainToShodanCTEnricher(Enricher):
                 root,
             )
         ):
+            #
+            # Drop in-scope CT domains which didn't
+            # resolve through local DNS.
+            #
             if (
                 normalized
                 != root
@@ -1786,17 +1706,10 @@ class DomainToShodanCTEnricher(Enricher):
             .rstrip(".")
         )
 
-        #
-        # *.a.example.com
-        # ->
-        # a.example.com
-        #
         while value.startswith(
             "*."
         ):
-            value = value[
-                2:
-            ]
+            value = value[2:]
 
         return (
             value
@@ -1912,6 +1825,31 @@ class DomainToShodanCTEnricher(Enricher):
                 ),
             ]
         )
+
+    @staticmethod
+    def _ip_sort_key(
+        address: str,
+    ) -> Tuple[
+        int,
+        int,
+    ]:
+        try:
+            ip_obj = (
+                ipaddress.ip_address(
+                    address
+                )
+            )
+
+            return (
+                ip_obj.version,
+                int(ip_obj),
+            )
+
+        except ValueError:
+            return (
+                99,
+                0,
+            )
 
     @staticmethod
     def _to_int(
