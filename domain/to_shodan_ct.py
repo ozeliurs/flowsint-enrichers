@@ -34,18 +34,32 @@ class DomainToShodanCTEnricher(Enricher):
     """
     Query Shodan Certificate Transparency for a domain.
 
-    Certificates are deduplicated by SHA-256 fingerprint.
-
     Graph model:
 
-        Domain
-          |
-          +-- HAS_CT_CERTIFICATE --> SSLCertificate
-          |                             |
-          |                             +-- HAS_SUBJECT --> Domain
-          |                             +-- HAS_SAN -----> Domain
-          |
-          +-- DISCOVERED_VIA_CT -----> Domain
+        root.example.com
+            |
+            +-- DISCOVERED_VIA_CT --> app.root.example.com
+            |                           ^
+            |                           |
+            |                      HAS_DOMAIN
+            |                           |
+            |                    SSLCertificate
+            |
+            +-- HAS_CT_CERTIFICATE --> SSLCertificate
+                                        |
+                                   HAS_DOMAIN
+                                        |
+                                        v
+                                 root.example.com
+
+    HAS_CT_CERTIFICATE is only created when the certificate explicitly
+    covers the queried root domain or its direct wildcard:
+
+        example.com
+        *.example.com
+
+    Certificates for subdomains are connected to those subdomains rather
+    than directly to the queried root.
     """
 
     InputType = Domain
@@ -81,37 +95,53 @@ class DomainToShodanCTEnricher(Enricher):
             not_after
             san_dns_names
 
-        Graph:
-
-            Domain
-              |
-              +-- HAS_CT_CERTIFICATE --> SSLCertificate
-              |                             |
-              |                             +-- HAS_SUBJECT --> Domain
-              |                             +-- HAS_SAN -----> Domain
-              |
-              +-- DISCOVERED_VIA_CT -----> Domain
-
-        Certificates are first deduplicated by SHA-256 fingerprint.
-
-        Flowsint's native SSLCertificate entity uses "subject" as its
-        primary identifier. Multiple certificate renewals for the same
-        subject are therefore aggregated into one SSLCertificate node.
-
-        Every individual certificate fingerprint, issuer, validity period,
-        and SAN list is retained in the "shodan_ct_certificates" property.
-
-        Wildcard names such as:
-
-            *.example.com
-
-        remain present on the certificate while the corresponding Domain
-        entity is normalized to:
+        Graph behavior:
 
             example.com
+              |
+              +-- DISCOVERED_VIA_CT --> app.example.com
+              |                           ^
+              |                           |
+              |                      HAS_DOMAIN
+              |                           |
+              |                    SSLCertificate
+              |
+              +-- HAS_CT_CERTIFICATE --> SSLCertificate
+                                          |
+                                     HAS_DOMAIN
+                                          |
+                                          v
+                                      example.com
 
-        External SANs are retained through HAS_SAN relationships but are
-        not marked as DISCOVERED_VIA_CT children of the queried root.
+        Root -> HAS_CT_CERTIFICATE is only created when the certificate
+        explicitly contains either:
+
+            example.com
+            *.example.com
+
+        A certificate such as:
+
+            *.app.example.com
+
+        instead produces:
+
+            example.com
+                |
+                +-- DISCOVERED_VIA_CT --> app.example.com
+                                            ^
+                                            |
+                                       HAS_DOMAIN
+                                            |
+                                    SSLCertificate
+
+        Subject and SAN relationships are deduplicated into a single
+        HAS_DOMAIN relationship.
+
+        Wildcard DNS names are normalized when creating Domain nodes:
+
+            *.app.example.com -> app.example.com
+
+        The original wildcard value remains preserved on the certificate.
         """
 
     async def scan(
@@ -149,8 +179,7 @@ class DomainToShodanCTEnricher(Enricher):
                         {
                             "message": (
                                 f"[Shodan CT] {domain}: "
-                                f"HTTP "
-                                f"{exc.response.status_code}"
+                                f"HTTP {exc.response.status_code}"
                             )
                         },
                     )
@@ -180,10 +209,7 @@ class DomainToShodanCTEnricher(Enricher):
                     )
                     continue
 
-                if not isinstance(
-                    payload,
-                    list,
-                ):
+                if not isinstance(payload, list):
                     Logger.error(
                         self.sketch_id,
                         {
@@ -196,8 +222,7 @@ class DomainToShodanCTEnricher(Enricher):
                     continue
 
                 #
-                # Certificate fingerprint is the real unique
-                # identifier returned by Shodan.
+                # Deduplicate raw CT entries by SHA-256.
                 #
                 unique: Dict[
                     str,
@@ -205,10 +230,7 @@ class DomainToShodanCTEnricher(Enricher):
                 ] = {}
 
                 for raw in payload:
-                    if not isinstance(
-                        raw,
-                        dict,
-                    ):
+                    if not isinstance(raw, dict):
                         continue
 
                     fingerprint = str(
@@ -224,33 +246,22 @@ class DomainToShodanCTEnricher(Enricher):
                         [],
                     )
 
-                    if not isinstance(
-                        sans,
-                        list,
-                    ):
+                    if not isinstance(sans, list):
                         sans = []
 
                     cert = ShodanCTCertificate(
                         hash=fingerprint,
                         subject_cn=self._optional_string(
-                            raw.get(
-                                "subject_cn"
-                            )
+                            raw.get("subject_cn")
                         ),
                         issuer_cn=self._optional_string(
-                            raw.get(
-                                "issuer_cn"
-                            )
+                            raw.get("issuer_cn")
                         ),
                         not_before=self._to_int(
-                            raw.get(
-                                "not_before"
-                            )
+                            raw.get("not_before")
                         ),
                         not_after=self._to_int(
-                            raw.get(
-                                "not_after"
-                            )
+                            raw.get("not_after")
                         ),
                         san_dns_names=sorted(
                             {
@@ -288,16 +299,18 @@ class DomainToShodanCTEnricher(Enricher):
                 discovered = {
                     normalized
                     for cert in certificates
-                    for raw_name in (
-                        self._certificate_names(
-                            cert
-                        )
+                    for raw_name in self._certificate_names(
+                        cert
                     )
                     if (
                         normalized :=
                         self._normalize_dns_name(
                             raw_name
                         )
+                    )
+                    and self._belongs_to(
+                        normalized,
+                        domain,
                     )
                 }
 
@@ -309,7 +322,7 @@ class DomainToShodanCTEnricher(Enricher):
                             f"{len(certificates)} "
                             f"unique certificates, "
                             f"{len(discovered)} "
-                            f"unique DNS names"
+                            f"in-scope DNS names"
                         )
                     },
                 )
@@ -343,12 +356,10 @@ class DomainToShodanCTEnricher(Enricher):
         ] = set()
 
         #
-        # Native SSLCertificate uses subject as primary.
+        # SSLCertificate is keyed by subject in Flowsint.
         #
-        # Therefore:
-        #
-        # subject ->
-        #     fingerprint -> certificate observation
+        # Therefore certificate renewals for the same subject
+        # are aggregated here.
         #
         certificates_by_subject: Dict[
             str,
@@ -362,6 +373,33 @@ class DomainToShodanCTEnricher(Enricher):
             str,
             set[str],
         ] = defaultdict(set)
+
+        #
+        # subject ->
+        #     normalized domain ->
+        #         {"subject", "san"}
+        #
+        # Keeping the roles in metadata lets us collapse the
+        # graph relationship to HAS_DOMAIN without losing the
+        # distinction entirely.
+        #
+        domain_roles_by_subject: Dict[
+            str,
+            Dict[
+                str,
+                set[str],
+            ],
+        ] = defaultdict(
+            lambda: defaultdict(set)
+        )
+
+        #
+        # Only certificates that explicitly cover the root
+        # are allowed to have root -> certificate edges.
+        #
+        root_certificate_links: set[
+            Tuple[str, str]
+        ] = set()
 
         #
         # Seed original input Domain nodes.
@@ -378,7 +416,7 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
         #
-        # Collect certificate history and domains.
+        # Collect graph entities and relationships.
         #
         for lookup in results:
             root = self._safe_domain(
@@ -412,25 +450,90 @@ class DomainToShodanCTEnricher(Enricher):
                 )
 
                 #
-                # Discover hostname-like values from both
-                # Subject CN and SAN.
+                # Only explicitly root-scoped certificates
+                # are connected directly to the root.
                 #
-                for raw_name in (
-                    self._certificate_names(
-                        cert
-                    )
+                if self._certificate_covers_root(
+                    cert,
+                    root.domain,
                 ):
-                    name = (
-                        self._normalize_dns_name(
-                            raw_name
+                    root_certificate_links.add(
+                        (
+                            root.domain,
+                            subject,
                         )
                     )
 
-                    if not name:
+                #
+                # Subject CN.
+                #
+                if cert.subject_cn:
+                    normalized = (
+                        self._normalize_dns_name(
+                            cert.subject_cn
+                        )
+                    )
+
+                    if normalized:
+                        node = self._safe_domain(
+                            normalized
+                        )
+
+                        if node:
+                            domain_nodes.setdefault(
+                                node.domain,
+                                node,
+                            )
+
+                            domain_roles_by_subject[
+                                subject
+                            ][
+                                node.domain
+                            ].add(
+                                "subject"
+                            )
+
+                            #
+                            # Any in-scope subdomain found
+                            # through CT is linked to the root.
+                            #
+                            if (
+                                node.domain
+                                != root.domain
+                                and self._belongs_to(
+                                    node.domain,
+                                    root.domain,
+                                )
+                            ):
+                                relationships.add(
+                                    (
+                                        (
+                                            "Domain",
+                                            root.domain,
+                                        ),
+                                        (
+                                            "Domain",
+                                            node.domain,
+                                        ),
+                                        "DISCOVERED_VIA_CT",
+                                    )
+                                )
+
+                #
+                # SAN entries.
+                #
+                for raw_san in cert.san_dns_names:
+                    normalized = (
+                        self._normalize_dns_name(
+                            raw_san
+                        )
+                    )
+
+                    if not normalized:
                         continue
 
                     node = self._safe_domain(
-                        name
+                        normalized
                     )
 
                     if node is None:
@@ -441,12 +544,18 @@ class DomainToShodanCTEnricher(Enricher):
                         node,
                     )
 
+                    domain_roles_by_subject[
+                        subject
+                    ][
+                        node.domain
+                    ].add(
+                        "san"
+                    )
+
                     #
-                    # Only in-scope children of the queried
-                    # domain receive DISCOVERED_VIA_CT.
-                    #
-                    # External SANs are still connected to
-                    # the certificate later.
+                    # External SANs stay connected to the
+                    # certificate but are NOT children of
+                    # the queried root.
                     #
                     if (
                         node.domain
@@ -477,7 +586,7 @@ class DomainToShodanCTEnricher(Enricher):
         )
 
         #
-        # Build aggregated native certificate nodes.
+        # Build certificate nodes.
         #
         for (
             subject,
@@ -492,10 +601,6 @@ class DomainToShodanCTEnricher(Enricher):
                 ),
             )
 
-            #
-            # Latest issuance is used for the native
-            # SSLCertificate scalar properties.
-            #
             latest = max(
                 certs,
                 key=lambda cert: (
@@ -508,8 +613,7 @@ class DomainToShodanCTEnricher(Enricher):
                 {
                     san
                     for cert in certs
-                    for san
-                    in cert.san_dns_names
+                    for san in cert.san_dns_names
                 }
             )
 
@@ -528,25 +632,18 @@ class DomainToShodanCTEnricher(Enricher):
                 }
             )
 
-            is_expired: Optional[
-                bool
-            ] = None
+            is_expired: Optional[bool] = None
 
             if latest.not_after is not None:
                 is_expired = (
-                    now
-                    > latest.not_after
+                    now > latest.not_after
                 )
 
-            is_valid: Optional[
-                bool
-            ] = None
+            is_valid: Optional[bool] = None
 
             if (
-                latest.not_before
-                is not None
-                and latest.not_after
-                is not None
+                latest.not_before is not None
+                and latest.not_after is not None
             ):
                 is_valid = (
                     latest.not_before
@@ -573,8 +670,7 @@ class DomainToShodanCTEnricher(Enricher):
                     subject.startswith("*.")
                     or any(
                         san.startswith("*.")
-                        for san
-                        in raw_sans
+                        for san in raw_sans
                     )
                 ),
                 source=(
@@ -587,7 +683,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
             #
-            # Preserve full Shodan CT history.
+            # Additional CT history.
             #
             setattr(
                 cert_node,
@@ -617,33 +713,43 @@ class DomainToShodanCTEnricher(Enricher):
                 ),
             )
 
+            #
+            # Keep certificate history in string form.
+            #
+            # This avoids relying on nested-map storage
+            # for Neo4j node properties.
+            #
             setattr(
                 cert_node,
-                "shodan_ct_certificates",
+                "shodan_ct_certificate_history",
                 [
-                    {
-                        "hash": cert.hash,
-                        "subject_cn": (
-                            cert.subject_cn
-                        ),
-                        "issuer_cn": (
-                            cert.issuer_cn
-                        ),
-                        "not_before": (
-                            self._epoch_to_iso(
-                                cert.not_before
-                            )
-                        ),
-                        "not_after": (
-                            self._epoch_to_iso(
-                                cert.not_after
-                            )
-                        ),
-                        "san_dns_names": (
-                            cert.san_dns_names
-                        ),
-                    }
+                    self._format_certificate_history(
+                        cert
+                    )
                     for cert in certs
+                ],
+            )
+
+            #
+            # Preserve whether each HAS_DOMAIN edge was
+            # originally found via Subject, SAN, or both.
+            #
+            setattr(
+                cert_node,
+                "shodan_ct_domain_roles",
+                [
+                    (
+                        f"{domain}="
+                        f"{','.join(sorted(roles))}"
+                    )
+                    for (
+                        domain,
+                        roles,
+                    ) in sorted(
+                        domain_roles_by_subject[
+                            subject
+                        ].items()
+                    )
                 ],
             )
 
@@ -652,95 +758,65 @@ class DomainToShodanCTEnricher(Enricher):
             ] = cert_node
 
             #
-            # Queried Domain -> certificate.
+            # Certificate -> covered Domain.
             #
-            for query_domain in (
-                queries_by_subject[
+            # Using a set of relationship tuples means:
+            #
+            #     Subject = app.example.com
+            #     SAN     = app.example.com
+            #
+            # still creates just:
+            #
+            #     certificate -[HAS_DOMAIN]-> app.example.com
+            #
+            for domain_name in (
+                domain_roles_by_subject[
                     subject
                 ]
             ):
                 relationships.add(
                     (
                         (
-                            "Domain",
-                            query_domain,
-                        ),
-                        (
-                            "SSLCertificate",
-                            subject,
-                        ),
-                        "HAS_CT_CERTIFICATE",
-                    )
-                )
-
-            #
-            # Certificate -> Subject CN Domain.
-            #
-            normalized_subject = (
-                self._normalize_dns_name(
-                    subject
-                )
-            )
-
-            if normalized_subject:
-                subject_domain = (
-                    self._safe_domain(
-                        normalized_subject
-                    )
-                )
-
-                if subject_domain:
-                    domain_nodes.setdefault(
-                        subject_domain.domain,
-                        subject_domain,
-                    )
-
-                    relationships.add(
-                        (
-                            (
-                                "SSLCertificate",
-                                subject,
-                            ),
-                            (
-                                "Domain",
-                                subject_domain.domain,
-                            ),
-                            "HAS_SUBJECT",
-                        )
-                    )
-
-            #
-            # Certificate -> SAN Domain.
-            #
-            for raw_san in raw_sans:
-                san = self._safe_domain(
-                    raw_san
-                )
-
-                if san is None:
-                    continue
-
-                domain_nodes.setdefault(
-                    san.domain,
-                    san,
-                )
-
-                relationships.add(
-                    (
-                        (
                             "SSLCertificate",
                             subject,
                         ),
                         (
                             "Domain",
-                            san.domain,
+                            domain_name,
                         ),
-                        "HAS_SAN",
+                        "HAS_DOMAIN",
                     )
                 )
 
         #
-        # Create unique Domain nodes.
+        # Root -> certificate relationships.
+        #
+        # These only exist for certificates explicitly
+        # covering:
+        #
+        #     example.com
+        #     *.example.com
+        #
+        for (
+            root_domain,
+            subject,
+        ) in root_certificate_links:
+            relationships.add(
+                (
+                    (
+                        "Domain",
+                        root_domain,
+                    ),
+                    (
+                        "SSLCertificate",
+                        subject,
+                    ),
+                    "HAS_CT_CERTIFICATE",
+                )
+            )
+
+        #
+        # Create Domain nodes.
         #
         for domain_name in sorted(
             domain_nodes
@@ -763,7 +839,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Create unique certificate nodes.
+        # Create certificate nodes.
         #
         for subject in sorted(
             certificate_nodes
@@ -775,7 +851,7 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         #
-        # Create unique graph relationships.
+        # Create relationships once.
         #
         for (
             source_key,
@@ -816,6 +892,55 @@ class DomainToShodanCTEnricher(Enricher):
         return results
 
     @staticmethod
+    def _certificate_covers_root(
+        cert: ShodanCTCertificate,
+        root: str,
+    ) -> bool:
+        """
+        Return True only if the certificate explicitly contains:
+
+            example.com
+
+        or:
+
+            *.example.com
+
+        It intentionally does NOT match:
+
+            app.example.com
+            *.app.example.com
+        """
+
+        root = (
+            root
+            .lower()
+            .rstrip(".")
+        )
+
+        accepted = {
+            root,
+            f"*.{root}",
+        }
+
+        for raw_name in (
+            DomainToShodanCTEnricher
+            ._certificate_names(
+                cert
+            )
+        ):
+            name = (
+                raw_name
+                .strip()
+                .lower()
+                .rstrip(".")
+            )
+
+            if name in accepted:
+                return True
+
+        return False
+
+    @staticmethod
     def _certificate_names(
         cert: ShodanCTCertificate,
     ) -> List[str]:
@@ -842,10 +967,6 @@ class DomainToShodanCTEnricher(Enricher):
                 .rstrip(".")
             )
 
-        #
-        # Defensive fallback if Shodan ever
-        # returns a certificate without subject_cn.
-        #
         return (
             f"sha256:{cert.hash}"
         )
@@ -854,6 +975,19 @@ class DomainToShodanCTEnricher(Enricher):
     def _normalize_dns_name(
         value: str,
     ) -> Optional[str]:
+        """
+        Convert wildcard certificate names into usable
+        Flowsint Domain nodes.
+
+        Examples:
+
+            *.example.com
+                -> example.com
+
+            *.a.example.com
+                -> a.example.com
+        """
+
         value = (
             value
             .strip()
@@ -861,18 +995,15 @@ class DomainToShodanCTEnricher(Enricher):
             .rstrip(".")
         )
 
-        #
-        # *.foo.example.com
-        # becomes:
-        #
-        # foo.example.com
-        #
         while value.startswith(
             "*."
         ):
             value = value[2:]
 
-        return value or None
+        return (
+            value
+            or None
+        )
 
     @staticmethod
     def _safe_domain(
@@ -894,11 +1025,6 @@ class DomainToShodanCTEnricher(Enricher):
             )
 
         except ValueError:
-            #
-            # Preserve the original value on the
-            # certificate instead of inventing a
-            # malformed Domain node.
-            #
             return None
 
     @staticmethod
@@ -951,6 +1077,28 @@ class DomainToShodanCTEnricher(Enricher):
             ValueError,
         ):
             return None
+
+    @staticmethod
+    def _format_certificate_history(
+        cert: ShodanCTCertificate,
+    ) -> str:
+        return " | ".join(
+            [
+                f"sha256={cert.hash}",
+                (
+                    "issuer="
+                    f"{cert.issuer_cn or ''}"
+                ),
+                (
+                    "not_before="
+                    f"{DomainToShodanCTEnricher._epoch_to_iso(cert.not_before) or ''}"
+                ),
+                (
+                    "not_after="
+                    f"{DomainToShodanCTEnricher._epoch_to_iso(cert.not_after) or ''}"
+                ),
+            ]
+        )
 
     @staticmethod
     def _to_int(
