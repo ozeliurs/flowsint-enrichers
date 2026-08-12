@@ -84,38 +84,14 @@ class ShodanCTLookup(BaseModel):
 
 @flowsint_enricher
 class DomainToShodanCTEnricher(Enricher):
-    """
-    Discover domains using Shodan Certificate Transparency,
-    validate them through local DNS resolution, and populate
-    the graph with resolving infrastructure only.
-
-    Graph:
-
-        example.com
-            |
-            +-- HAS_SUBDOMAIN --> app.example.com
-            |                       |
-            |                       +-- RESOLVES_TO --> Ip
-            |                       |
-            |                       +-- HOSTED_IN --> CLOUDFLARENET
-            |
-            +-- HAS_CT_CERTIFICATE --> SSLCertificate
-
-        SSLCertificate
-            |
-            +-- HAS_DOMAIN --> app.example.com
-
-    Non-resolving CT-discovered domains are discarded.
-
-    Cloudflare IPs are collapsed into a single ASN node.
-    """
+    """[SHODAN] Find subdomains using Shodan Certificate Transparency, resolve them, cleanup Cloudfalre IPs."""
 
     InputType = Domain
     OutputType = ShodanCTLookup
 
     @classmethod
     def name(cls) -> str:
-        return "domain_to_shodan_ct"
+        return "domain_to_shodan_ct_subdomains"
 
     @classmethod
     def category(cls) -> str:
@@ -124,63 +100,6 @@ class DomainToShodanCTEnricher(Enricher):
     @classmethod
     def key(cls) -> str:
         return "domain"
-
-    @classmethod
-    def documentation(cls) -> str:
-        return """
-        Query Shodan Certificate Transparency and validate
-        discovered domains through local DNS resolution.
-
-        Workflow:
-
-        1. Query Shodan CT:
-
-               GET https://ctl.shodan.io/api/v1/domain/{domain}
-
-        2. Extract Subject CN and SAN DNS names.
-
-        3. Normalize wildcards:
-
-               *.app.example.com
-                   ->
-               app.example.com
-
-        4. Resolve every discovered in-scope hostname using
-           the system DNS resolver through Python
-           socket.getaddrinfo().
-
-        5. Keep only hostnames with at least one IPv4 or IPv6
-           address.
-
-        6. Build the hierarchy using:
-
-               HAS_SUBDOMAIN
-
-        7. Link certificates using:
-
-               HAS_DOMAIN
-
-        8. Normal IPs:
-
-               Domain
-                   |
-                   +-- RESOLVES_TO --> Ip
-
-        9. Cloudflare addresses:
-
-               Domain
-                   |
-                   +-- HOSTED_IN --> CLOUDFLARENET
-
-        Root -> HAS_CT_CERTIFICATE is only created for
-        certificates explicitly covering:
-
-               example.com
-
-        or:
-
-               *.example.com
-        """
 
     async def scan(
         self,
