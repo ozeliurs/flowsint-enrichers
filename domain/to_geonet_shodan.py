@@ -37,21 +37,7 @@ class GeoNetRecord(BaseModel):
 @flowsint_enricher
 class DomainToGeoNetShodanEnricher(Enricher):
     """
-    Resolve DNS records through Shodan GeoNet.
-
-    The enricher queries:
-      - A
-      - AAAA
-      - MX
-      - NS
-      - TXT
-
-    Results returned by multiple GeoNet locations are deduplicated.
-
-    Graph mapping:
-      A/AAAA -> Ip
-      MX/NS  -> Domain
-      TXT    -> DNSRecord
+    [SHODAN] Resolve DNS records through Shodan GeoNet.
     """
 
     InputType = Domain
@@ -68,36 +54,6 @@ class DomainToGeoNetShodanEnricher(Enricher):
     @classmethod
     def key(cls) -> str:
         return "domain"
-
-    @classmethod
-    def documentation(cls) -> str:
-        return """
-        Query Shodan GeoNet for A, AAAA, MX, NS and TXT records.
-
-        GeoNet performs DNS lookups from several geographic locations.
-        Identical answers are deduplicated while preserving all geographic
-        vantage points that observed each result.
-
-        Graph output:
-
-          A / AAAA -> Ip
-                      RESOLVES_TO
-
-          MX       -> Domain
-                      HAS_MAIL_EXCHANGER
-
-          NS       -> Domain
-                      HAS_NAMESERVER
-
-          TXT      -> DNSRecord
-                      HAS_TXT_RECORD
-
-        GeoNet metadata is added to generated target nodes through:
-
-          geonet_source
-          geonet_record_types
-          geonet_observations
-        """
 
     async def scan(
         self,
