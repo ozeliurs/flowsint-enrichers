@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from pydantic import BaseModel, ConfigDict, Field
 
 from flowsint_core.core.enricher_base import Enricher
 from flowsint_core.core.logger import Logger
@@ -12,6 +13,20 @@ from flowsint_types.dns_record import DNSRecord
 from flowsint_types.domain import Domain
 from flowsint_types.ip import Ip
 from flowsint_types.port import Port
+
+
+class ParamsModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    SHODAN_API_KEY: str
+    history: str = "false"
+    record_type: str = "ALL"
+    max_pages: int = Field(default=1, ge=1, le=100)
+    enrich_host_ips: str = "true"
+    max_host_lookups: int = Field(default=25, ge=1, le=1000)
+    host_history: str = "false"
+    host_minify: str = "false"
+    timeout: int = Field(default=30, ge=1, le=300)
 
 
 class ShodanDomainClient:
@@ -226,6 +241,10 @@ class DomainToShodanEnricher(Enricher):
                 "default": 30,
             },
         ]
+
+    @classmethod
+    def get_params_model(cls):
+        return ParamsModel
 
     @classmethod
     def name(cls) -> str:
